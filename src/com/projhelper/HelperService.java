@@ -6,15 +6,18 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ResolveInfo;
 import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.UserManager;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.KeyEvent;
@@ -53,7 +56,10 @@ public class HelperService extends Service {
     private long overlayDismissedAt;
 
     private String homePkg = "";
-    private boolean bootHandled;
+    private boolean unlocked;
+    private UnlockReceiver unlockReceiver;
+    private boolean bootRequested, bootHandled;
+    /** 用 elapsedRealtime，开机时系统时钟会跳。 */
     private long bootPendingSince;
     private long castLaunchedAt;
     private long castSeenAt;
@@ -71,7 +77,7 @@ public class HelperService extends Service {
         try {
             c.startActivity(i);
         } catch (Exception e) {
-            Log.w(TAG, "launch miracast failed", e);
+            Diag.log(c, "launch miracast failed: " + e);
         }
     }
 
@@ -88,28 +94,60 @@ public class HelperService extends Service {
 
         usm = getSystemService(UsageStatsManager.class);
         wm = getSystemService(WindowManager.class);
+
+        // 开机时可能是被 LOCKED_BOOT_COMPLETED 拉起的，这时用户数据还没解锁：
+        // 设置、使用记录、桌面都还不能用，先留在后台等解锁通知（只发给正在运行的程序，不用排队）
+        if (getSystemService(UserManager.class).isUserUnlocked()) {
+            onUnlocked();
+        } else {
+            Diag.log(this, "service created while locked, waiting for unlock");
+            unlockReceiver = new UnlockReceiver(this);
+            registerReceiver(unlockReceiver, new IntentFilter(Intent.ACTION_USER_UNLOCKED));
+            // 注册前那一刻刚好解锁的话，通知就错过了，再查一次
+            if (getSystemService(UserManager.class).isUserUnlocked()) onUnlocked();
+        }
+    }
+
+    private void onUnlocked() {
+        if (unlocked) return;
+        unlocked = true;
+        if (unlockReceiver != null) {
+            unregisterReceiver(unlockReceiver);
+            unlockReceiver = null;
+        }
         // 使用记录重启后还在，只看本次开机之后的，免得把关机前的投屏界面当成现在的前台
         long bootTime = System.currentTimeMillis() - SystemClock.elapsedRealtime();
         lastEventTs = Math.max(System.currentTimeMillis() - 6 * 3600 * 1000L, bootTime);
         ResolveInfo home = getPackageManager().resolveActivity(
                 new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0);
         if (home != null && home.activityInfo != null) homePkg = home.activityInfo.packageName;
+        Diag.log(this, "unlocked, home=" + homePkg);
+        if (bootRequested) handleBoot();
         handler.post(poll);
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         // LOCKED_BOOT_COMPLETED 和 BOOT_COMPLETED 都会走到这里，只处理第一次
-        if (intent != null && ACTION_BOOT.equals(intent.getAction()) && !bootHandled
-                && Weather.prefs(this).getBoolean("boot_cast", true)) {
-            bootHandled = true;
-            bootPendingSince = System.currentTimeMillis();
-            Log.i(TAG, "boot received, home=" + homePkg + ", fg=" + fgPkg);
+        if (intent != null && ACTION_BOOT.equals(intent.getAction())) {
+            Diag.log(this, "boot intent (unlocked=" + unlocked + ")");
+            bootRequested = true;
+            if (!unlocked && getSystemService(UserManager.class).isUserUnlocked()) onUnlocked();
+            if (unlocked) handleBoot();
         }
         return START_STICKY;
     }
 
+    private void handleBoot() {
+        if (bootHandled) return;
+        bootHandled = true;
+        if (Weather.prefs(this).getBoolean("boot_cast", true)) {
+            bootPendingSince = SystemClock.elapsedRealtime();
+        }
+    }
+
     @Override public void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        if (unlockReceiver != null) unregisterReceiver(unlockReceiver);
         hideOverlay();
         super.onDestroy();
     }
@@ -125,14 +163,15 @@ public class HelperService extends Service {
     /** 开机后等桌面出现（或等太久）再打开投屏；投屏已经在前台（比如用户自己点开了）就不管了。 */
     private void maybeBootLaunch() {
         if (bootPendingSince == 0) return;
-        long now = System.currentTimeMillis();
+        long waited = SystemClock.elapsedRealtime() - bootPendingSince;
         if (MIRACAST.equals(fgPkg)) {
+            Diag.log(this, "miracast already in front, skip boot launch");
             bootPendingSince = 0;
             return;
         }
-        boolean homeReady = isHome(fgPkg) && now - fgSince >= HOME_SETTLE_MS;
-        if (homeReady || now - bootPendingSince >= BOOT_MAX_WAIT_MS) {
-            Log.i(TAG, "boot launch after " + (now - bootPendingSince) + "ms, fg=" + fgPkg);
+        boolean homeReady = isHome(fgPkg) && System.currentTimeMillis() - fgSince >= HOME_SETTLE_MS;
+        if (homeReady || waited >= BOOT_MAX_WAIT_MS) {
+            Diag.log(this, "boot launch after " + waited + "ms, fg=" + fgPkg);
             bootPendingSince = 0;
             bootLaunch();
         }
@@ -151,7 +190,7 @@ public class HelperService extends Service {
         boolean coveredQuickly = castSeenAt == 0 || fgSince - castSeenAt < 3000;
         if (coveredQuickly) {
             bootRetries++;
-            Log.i(TAG, "miracast covered after boot (seen=" + castSeenAt + ", fg=" + fgPkg
+            Diag.log(this, "miracast covered after boot (seen=" + castSeenAt + ", fg=" + fgPkg
                     + "), relaunching #" + bootRetries);
             bootLaunch();
         }
@@ -185,6 +224,7 @@ public class HelperService extends Service {
             fgCls = e.getClassName() == null ? "" : e.getClassName();
             fgSince = ts;
             foreground = fgPkg + "/" + fgCls;
+            if (SystemClock.elapsedRealtime() < 5 * 60 * 1000L) Diag.log(this, "fg " + foreground);
             if (MIRACAST.equals(fgPkg) && castLaunchedAt > 0 && castSeenAt == 0
                     && ts >= castLaunchedAt) {
                 castSeenAt = ts;
@@ -239,6 +279,19 @@ public class HelperService extends Service {
         } catch (Exception ignored) {
         }
         overlay = null;
+    }
+
+    /** 开机早期等用户数据解锁。 */
+    static final class UnlockReceiver extends BroadcastReceiver {
+        private final HelperService service;
+
+        UnlockReceiver(HelperService service) {
+            this.service = service;
+        }
+
+        @Override public void onReceive(Context c, Intent intent) {
+            service.onUnlocked();
+        }
     }
 
     /** 叠加时钟的根布局：按下和抬起都吃掉，抬起时收起，避免按键漏给下面的投屏界面。 */
