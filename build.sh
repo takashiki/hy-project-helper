@@ -6,8 +6,8 @@ cd "$(dirname "$0")"
 SDK=${ANDROID_HOME:-/opt/android-sdk}
 BT=$SDK/build-tools/34.0.0
 JAR=$SDK/platforms/android-28/android.jar
-VERSION_CODE=${VERSION_CODE:-1}
-VERSION_NAME=${VERSION_NAME:-1.0}
+VERSION_CODE=${VERSION_CODE:-2}
+VERSION_NAME=${VERSION_NAME:-1.1}
 # 签名文件 release.jks 不进仓库，自己私下保存，构建时放到本目录
 KS_PASS=${KS_PASS:-projhelper}
 

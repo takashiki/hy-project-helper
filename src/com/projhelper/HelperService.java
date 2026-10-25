@@ -9,10 +9,12 @@ import android.app.usage.UsageStatsManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ResolveInfo;
 import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.KeyEvent;
@@ -32,8 +34,11 @@ public class HelperService extends Service {
     static final ComponentName CAST =
             new ComponentName(MIRACAST, MIRACAST + ".activity.WelcomeActivity");
     private static final String TAG = "ProjHelper";
-    private static final long BOOT_DELAY_MS = 8000;
+    /** 开机后等桌面出现多久再打开投屏；一直等不到桌面就在 BOOT_MAX_WAIT_MS 后直接打开。 */
+    private static final long HOME_SETTLE_MS = 1500;
+    private static final long BOOT_MAX_WAIT_MS = 20000;
     private static final long BOOT_CHECK_MS = 15000;
+    private static final int BOOT_MAX_RETRIES = 2;
 
     /** 当前前台界面，供 MainActivity 显示状态。 */
     static volatile String foreground = "";
@@ -47,9 +52,12 @@ public class HelperService extends Service {
     private View overlay;
     private long overlayDismissedAt;
 
+    private String homePkg = "";
+    private boolean bootHandled;
+    private long bootPendingSince;
     private long castLaunchedAt;
     private long castSeenAt;
-    private boolean bootRetried;
+    private int bootRetries;
 
     static void start(Context c, String action) {
         Intent i = new Intent(c, HelperService.class);
@@ -80,14 +88,22 @@ public class HelperService extends Service {
 
         usm = getSystemService(UsageStatsManager.class);
         wm = getSystemService(WindowManager.class);
-        lastEventTs = System.currentTimeMillis() - 6 * 3600 * 1000L;
+        // 使用记录重启后还在，只看本次开机之后的，免得把关机前的投屏界面当成现在的前台
+        long bootTime = System.currentTimeMillis() - SystemClock.elapsedRealtime();
+        lastEventTs = Math.max(System.currentTimeMillis() - 6 * 3600 * 1000L, bootTime);
+        ResolveInfo home = getPackageManager().resolveActivity(
+                new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0);
+        if (home != null && home.activityInfo != null) homePkg = home.activityInfo.packageName;
         handler.post(poll);
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_BOOT.equals(intent.getAction())
+        // LOCKED_BOOT_COMPLETED 和 BOOT_COMPLETED 都会走到这里，只处理第一次
+        if (intent != null && ACTION_BOOT.equals(intent.getAction()) && !bootHandled
                 && Weather.prefs(this).getBoolean("boot_cast", true)) {
-            handler.postDelayed(this::bootLaunch, BOOT_DELAY_MS);
+            bootHandled = true;
+            bootPendingSince = System.currentTimeMillis();
+            Log.i(TAG, "boot received, home=" + homePkg + ", fg=" + fgPkg);
         }
         return START_STICKY;
     }
@@ -102,6 +118,26 @@ public class HelperService extends Service {
         return null;
     }
 
+    private boolean isHome(String pkg) {
+        return pkg.equals(homePkg) || pkg.contains("launcher");
+    }
+
+    /** 开机后等桌面出现（或等太久）再打开投屏；投屏已经在前台（比如用户自己点开了）就不管了。 */
+    private void maybeBootLaunch() {
+        if (bootPendingSince == 0) return;
+        long now = System.currentTimeMillis();
+        if (MIRACAST.equals(fgPkg)) {
+            bootPendingSince = 0;
+            return;
+        }
+        boolean homeReady = isHome(fgPkg) && now - fgSince >= HOME_SETTLE_MS;
+        if (homeReady || now - bootPendingSince >= BOOT_MAX_WAIT_MS) {
+            Log.i(TAG, "boot launch after " + (now - bootPendingSince) + "ms, fg=" + fgPkg);
+            bootPendingSince = 0;
+            bootLaunch();
+        }
+    }
+
     private void bootLaunch() {
         castLaunchedAt = System.currentTimeMillis();
         castSeenAt = 0;
@@ -109,13 +145,14 @@ public class HelperService extends Service {
         handler.postDelayed(this::bootCheck, BOOT_CHECK_MS);
     }
 
-    /** 开机时桌面可能晚于投屏加载、把它盖住；这种情况补开一次。用户自己按返回退出的不管。 */
+    /** 开机时桌面可能晚于投屏加载、把它盖住；这种情况补开，最多两次。用户自己按返回退出的不管。 */
     private void bootCheck() {
-        if (bootRetried || MIRACAST.equals(fgPkg)) return;
+        if (bootRetries >= BOOT_MAX_RETRIES || MIRACAST.equals(fgPkg)) return;
         boolean coveredQuickly = castSeenAt == 0 || fgSince - castSeenAt < 3000;
         if (coveredQuickly) {
-            bootRetried = true;
-            Log.i(TAG, "miracast covered after boot, relaunching");
+            bootRetries++;
+            Log.i(TAG, "miracast covered after boot (seen=" + castSeenAt + ", fg=" + fgPkg
+                    + "), relaunching #" + bootRetries);
             bootLaunch();
         }
     }
@@ -125,6 +162,7 @@ public class HelperService extends Service {
     private void onPoll() {
         try {
             updateForeground();
+            maybeBootLaunch();
             evaluate();
         } catch (Exception e) {
             Log.w(TAG, "poll failed", e);

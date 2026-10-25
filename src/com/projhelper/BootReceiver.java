@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.os.UserManager;
 
 /**
  * 开机 / 更新后启动服务；另外接收 adb 发来的配置：
@@ -15,6 +16,11 @@ public class BootReceiver extends BroadcastReceiver {
         String action = intent.getAction();
         if (Intent.ACTION_BOOT_COMPLETED.equals(action)) {
             HelperService.start(c, HelperService.ACTION_BOOT);
+        } else if (Intent.ACTION_LOCKED_BOOT_COMPLETED.equals(action)) {
+            // 比 BOOT_COMPLETED 早发、排队的接收者少；没有文件加密的设备这时已经解锁，可以直接用
+            if (c.getSystemService(UserManager.class).isUserUnlocked()) {
+                HelperService.start(c, HelperService.ACTION_BOOT);
+            }
         } else if (Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
             HelperService.start(c, null);
         } else if ("com.projhelper.CONFIG".equals(action)) {
